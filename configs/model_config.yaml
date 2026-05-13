@@ -1,0 +1,15 @@
+svr:
+  kernel: rbf
+  poly_degree: 2
+  scaler: robust
+  transformer: yeo-johnson
+
+gpr:
+  kernel:
+    - rbf
+    - rational_quadratic
+    - white_kernel
+
+ensemble:
+  weighted: true
+  stacking: true
