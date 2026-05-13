@@ -1,0 +1,7 @@
+data_path: data/raw/Sheet2.csv
+
+report_dir: reports/
+figure_dir: reports/figures/
+
+model_dir: models/saved_models/
+checkpoint_dir: models/checkpoints/
