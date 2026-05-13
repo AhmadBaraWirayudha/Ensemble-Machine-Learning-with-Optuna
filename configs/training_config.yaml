@@ -1,0 +1,9 @@
+random_state: 151101
+
+cross_validation:
+  n_splits: 5
+
+optuna:
+  svr_trials: 60
+  gpr_trials: 60
+  ensemble_trials: 80
