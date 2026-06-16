@@ -1,0 +1,6 @@
+target: surface_roughness
+
+features:
+  - feed_rate
+  - spindle_speed
+  - depth_of_cut

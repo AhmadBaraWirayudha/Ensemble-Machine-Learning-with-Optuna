@@ -1,0 +1,8 @@
+xgboost:
+  n_estimators:
+    low: 50
+    high: 500
+
+  max_depth:
+    low: 3
+    high: 10
