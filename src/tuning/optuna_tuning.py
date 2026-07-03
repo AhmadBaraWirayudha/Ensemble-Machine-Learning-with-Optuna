@@ -33,7 +33,33 @@ def create_stratified_bins(y, n_bins=5):
     return bins.codes
 
 
-def tune_svr(X, y):
+def tune_svr(
+    X,
+    y,
+    n_trials=None,
+    max_poly_degree=4,
+    n_splits=None,
+    random_state=None,
+    use_pruning=True,
+    show_progress_bar=True,
+):
+    """
+    Tune SVR hyperparameters with Optuna.
+
+    poly_degree is searched in [2, max_poly_degree]. Be aware of the cost:
+    on this dataset's 12 base features, PolynomialFeatures expansion goes
+    from 90 output features at degree=2 to 1819 at degree=4, so a degree=4
+    trial's 5-fold CV costs roughly 20x a degree=2 trial (measured: ~1.2s
+    vs ~25s per fit). With only 119 training rows, degree=4 is also deep
+    into "more features than samples" overfitting territory. Pruning
+    (median pruner, on by default) lets clearly-uncompetitive trials -
+    which is often the expensive high-degree ones - get abandoned after
+    the first fold or two instead of always paying for all 5.
+    """
+
+    n_trials = n_trials if n_trials is not None else SVR_TRIALS
+    n_splits = n_splits if n_splits is not None else N_SPLITS
+    random_state = random_state if random_state is not None else RANDOM_STATE
 
     bins = create_stratified_bins(y)
 
@@ -63,7 +89,7 @@ def tune_svr(X, y):
         poly_degree = trial.suggest_int(
             "poly_degree",
             2,
-            4
+            max_poly_degree
         )
 
         model = build_svr_pipeline(
@@ -74,15 +100,15 @@ def tune_svr(X, y):
         )
 
         cv = StratifiedKFold(
-            n_splits=N_SPLITS,
+            n_splits=n_splits,
             shuffle=True,
-            random_state=RANDOM_STATE
+            random_state=random_state
         )
 
         predictions = []
         targets = []
 
-        for train_idx, test_idx in cv.split(X, bins):
+        for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X, bins)):
 
             X_train = X[train_idx]
             X_test = X[test_idx]
@@ -97,25 +123,51 @@ def tune_svr(X, y):
             predictions.extend(preds.tolist())
             targets.extend(y_test.tolist())
 
+            if use_pruning:
+                running_mse = mean_squared_error(targets, predictions)
+                trial.report(running_mse, step=fold_idx)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
         return mean_squared_error(targets, predictions)
+
+    pruner = (
+        optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
+        if use_pruning
+        else optuna.pruners.NopPruner()
+    )
 
     study = optuna.create_study(
         direction="minimize",
         sampler=optuna.samplers.TPESampler(
-            seed=RANDOM_STATE
-        )
+            seed=random_state
+        ),
+        pruner=pruner,
     )
 
     study.optimize(
         objective,
-        n_trials=SVR_TRIALS,
-        show_progress_bar=True
+        n_trials=n_trials,
+        show_progress_bar=show_progress_bar
     )
 
     return study.best_params
 
 
-def tune_gpr(X, y):
+def tune_gpr(
+    X,
+    y,
+    n_trials=None,
+    n_splits=None,
+    random_state=None,
+    use_pruning=True,
+    show_progress_bar=True,
+):
+    """Tune GPR hyperparameters with Optuna."""
+
+    n_trials = n_trials if n_trials is not None else GPR_TRIALS
+    n_splits = n_splits if n_splits is not None else N_SPLITS
+    random_state = random_state if random_state is not None else RANDOM_STATE
 
     bins = create_stratified_bins(y)
 
@@ -157,15 +209,15 @@ def tune_gpr(X, y):
         )
 
         cv = StratifiedKFold(
-            n_splits=N_SPLITS,
+            n_splits=n_splits,
             shuffle=True,
-            random_state=RANDOM_STATE
+            random_state=random_state
         )
 
         predictions = []
         targets = []
 
-        for train_idx, test_idx in cv.split(X, bins):
+        for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X, bins)):
 
             X_train = X[train_idx]
             X_test = X[test_idx]
@@ -180,19 +232,32 @@ def tune_gpr(X, y):
             predictions.extend(preds.tolist())
             targets.extend(y_test.tolist())
 
+            if use_pruning:
+                running_mse = mean_squared_error(targets, predictions)
+                trial.report(running_mse, step=fold_idx)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
         return mean_squared_error(targets, predictions)
+
+    pruner = (
+        optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
+        if use_pruning
+        else optuna.pruners.NopPruner()
+    )
 
     study = optuna.create_study(
         direction="minimize",
         sampler=optuna.samplers.TPESampler(
-            seed=RANDOM_STATE
-        )
+            seed=random_state
+        ),
+        pruner=pruner,
     )
 
     study.optimize(
         objective,
-        n_trials=GPR_TRIALS,
-        show_progress_bar=True
+        n_trials=n_trials,
+        show_progress_bar=show_progress_bar
     )
 
     return study.best_params
@@ -201,8 +266,20 @@ def tune_gpr(X, y):
 def optimize_ensemble_weight(
     y_true,
     y_pred_svr,
-    y_pred_gpr
+    y_pred_gpr,
+    n_trials=None,
+    random_state=None,
+    show_progress_bar=True,
 ):
+    """
+    Optimize the weighted-ensemble blend alpha * GPR + (1 - alpha) * SVR.
+    Operates purely on already-computed out-of-fold predictions, so unlike
+    tune_svr/tune_gpr this never fits a model - even 80+ trials finish in
+    well under a second.
+    """
+
+    n_trials = n_trials if n_trials is not None else ENSEMBLE_TRIALS
+    random_state = random_state if random_state is not None else RANDOM_STATE
 
     def objective(trial):
 
@@ -225,14 +302,14 @@ def optimize_ensemble_weight(
     study = optuna.create_study(
         direction="minimize",
         sampler=optuna.samplers.TPESampler(
-            seed=RANDOM_STATE
+            seed=random_state
         )
     )
 
     study.optimize(
         objective,
-        n_trials=ENSEMBLE_TRIALS,
-        show_progress_bar=True
+        n_trials=n_trials,
+        show_progress_bar=show_progress_bar
     )
 
     return study.best_params["alpha"]

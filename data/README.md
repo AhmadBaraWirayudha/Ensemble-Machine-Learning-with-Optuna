@@ -19,9 +19,10 @@ data/
 
 Contains original datasets without modification.
 
-Example:
-
-- `Sheet2.csv`
+Actual file in this repo: `raw_data.csv` (119 rows after cleaning; see
+`src/preprocessing/data_loader.py`). Earlier config files in this repo
+referred to a `Sheet2.csv` that was never actually present - `raw_data.csv`
+has always been the real source of truth.
 
 ---
 
@@ -34,6 +35,11 @@ Examples:
 - normalized datasets
 - train/test split datasets
 - feature-engineered datasets
+
+**Currently unused** (placeholder `.gitkeep` only) - `load_dataset()` and
+`add_engineered_features()` clean and engineer features in-memory on every
+run rather than writing intermediate files here. `interim/` is the same:
+present for future use, nothing writes to it yet.
 
 ---
 

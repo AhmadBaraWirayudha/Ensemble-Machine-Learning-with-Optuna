@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount over the baked-in model so a retrained bundle (produced by
+      # `python scripts/train_model.py` on the host, or by `docker compose
+      # exec api python scripts/train_model.py`) is picked up on restart
+      # without rebuilding the image.
+      - ./models:/app/models
+      # Prediction log + drift reports survive container restarts/rebuilds.
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+    restart: unless-stopped
