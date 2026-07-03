@@ -205,3 +205,23 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ============================================================
+# Project-specific: generated at runtime, regenerable on demand
+# ============================================================
+
+# Prediction request log (production data, and can grow unbounded)
+logs/*.jsonl
+
+# Drift reports and training report outputs - regenerate via
+# `python scripts/train_model.py` / `python -m monitoring.drift_monitor`
+reports/drift/*.json
+reports/metrics/*.csv
+reports/figures/*.png
+
+# Trained model artifacts. Intentionally NOT ignored by default: this repo
+# ships a pre-trained model so the API works immediately after cloning
+# without requiring a training run first. If you retrain often and would
+# rather not commit binary diffs each time, uncomment the next line:
+# models/saved_models/*.joblib
+
