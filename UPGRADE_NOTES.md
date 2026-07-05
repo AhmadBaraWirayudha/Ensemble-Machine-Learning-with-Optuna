@@ -95,14 +95,50 @@ grid instead of landing exactly on it) to demo the tool without waiting
 for real production traffic. See "PSI needs more samples than you'd
 think" below for why this isn't just a threshold check.
 
+**Automatic retraining** (`monitoring/retrain_trigger.py`) - closes the
+loop between the two pieces above: checks the drift verdict, and if it's
+`DRIFT_DETECTED`, retrains and decides whether to actually deploy the
+result. Before overwriting anything, the current bundle is backed up to
+`models/saved_models/archive/<timestamp>/`; after retraining, the new
+model's out-of-fold RMSE is compared against the old one's recorded RMSE,
+and if it's worse by more than `--max-regression-pct` (default 15%), the
+backup is restored instead of promoting a regression. An automated
+pipeline silently deploying a worse quality-prediction model is a worse
+outcome than it doing nothing. Every attempt - skipped, promoted, or
+rolled back - is appended to `logs/retrain_log.jsonl`, readable via
+`GET /retrain/history`. Deliberately a CLI/scheduled-job tool rather than
+an API endpoint: retraining takes minutes and overwrites the production
+model, neither of which belongs behind a synchronous HTTP call.
+`--dry-run` reports what would happen without doing it;
+`--force-retrain` skips the drift check entirely, for a periodic
+(e.g. weekly) retrain regardless of detected drift.
+
 **Training script** (`scripts/train_model.py`, `src/train/train.py`)
 Thin CLI over a `main()` that: loads + validates data, tunes SVR/GPR with
 Optuna (now with median pruning and a configurable trial budget/search
 space - see below), collects out-of-fold predictions for honest ensemble
-evaluation, refits the base models on all available data, and persists
-the result. Accepts pre-computed `svr_params`/`gpr_params` to skip
-tuning entirely - useful for redeploying a known-good configuration
-without paying for a fresh search.
+evaluation, refits the base models on all available data, computes
+permutation feature importance, and persists all of it. Accepts
+pre-computed `svr_params`/`gpr_params` to skip tuning entirely - useful
+for redeploying a known-good configuration without paying for a fresh
+search.
+
+**Feature importance** (`src/metrics/feature_importance.py`) - the
+original prototype computed permutation importance too, but did it
+*inside* the polynomial-expanded feature space and then tried to map
+auto-generated names like `x3 x7` back to `Vc`/`Fz`/`ap` by string
+matching - fragile, and the reason this was initially left as a follow-up
+rather than ported over directly. It turned out not to need porting:
+`sklearn.inspection.permutation_importance` takes the whole fitted
+*pipeline* (poly expansion included) and permutes whatever columns of X
+you hand it, so calling it with our 12 named engineered features means
+the result is already indexed by clean names, with the internal
+polynomial expansion handled transparently. `by_variable` further rolls
+those 12 up to the raw `Vc`/`Fz`/`ap` parameter each one derives from (an
+interaction term like `Vc_Fz` counts toward both, not split between them
+- see the docstring). Computed once at training time, served statically
+via `GET /model/feature-importance`. On the current model, `Vc` (cutting
+speed) comes out as the most important parameter for both SVR and GPR.
 
 **Docker** - `Dockerfile` + `docker-compose.yml`. Trains offline, serves
 an immutable artifact (the image ships whatever's in
@@ -112,8 +148,20 @@ without rebuilding. Not build-tested in the sandbox this was developed in
 (no Docker daemon available there) - straightforward pip-only
 dependencies, but worth a first build/run check on your end.
 
+**Authentication** (`app/auth.py`) - opt-in API key check, off by
+default. Set `CNC_API_KEY` and every data endpoint requires a matching
+`X-API-Key` header (constant-time comparison via `secrets.compare_digest`,
+not a plain `==`); `/health` never requires one, so liveness checks keep
+working either way. Off-by-default was a deliberate choice: every test and
+example written before this feature existed keeps working unmodified,
+rather than needing a key threaded through everywhere. This is a
+shared-secret scheme appropriate for a handful of trusted internal
+systems (an MES, a QC script) - not a real identity provider for many
+distinct external users.
+
 **Tests** - `test_persistence.py`, `test_inference.py`, `test_api.py`,
-`test_drift_monitor.py` added alongside the 7 original (now-passing) tests.
+`test_auth.py`, `test_drift_monitor.py`, `test_feature_importance.py`,
+`test_retrain_trigger.py` added alongside the 7 original (now-passing) tests.
 
 ## Design decisions worth knowing about
 
@@ -135,10 +183,14 @@ On this dataset, `PolynomialFeatures` inside the SVR pipeline expands the
 `degree=4` - measured fit times of ~1.2s / ~6s / ~25s respectively, on
 only 119 training rows. `degree=4` is also solidly into
 more-features-than-samples overfitting territory. The default `quick`
-preset (25/25/40 trials, `poly_degree` capped at 3) trains in a couple of
-minutes; `--preset full` restores the original 60/60/80-trial, degree-4
-search space from `configs/training_config.yaml`, which took over two
-minutes for just 20 trials in testing - expect it to run considerably
+preset (25 trials each for SVR/GPR/RandomForest/GradientBoosting, 40 for
+the ensemble weight, SVR's `poly_degree` capped at 3) trains in a couple
+of minutes; `--preset full` restores the original 60/60-trial, degree-4
+search space from `configs/training_config.yaml` for SVR/GPR specifically
+(RF/GBM trial counts don't change much between presets - tree ensembles
+are cheap here, seconds not tens-of-seconds per trial, regardless of
+poly_degree concerns that don't apply to them). `full` took over two
+minutes for just 20 SVR trials in testing - expect it to run considerably
 longer. Optuna median pruning (on by default) cuts short trials that are
 clearly uncompetitive after 1-2 CV folds rather than always paying for
 all 5.
@@ -163,13 +215,146 @@ baseline) and checking it correctly stayed quiet, not just against the
 "drift" case - it's worth doing the same check before trusting a metric
 like this on any new dataset.
 
-**Metrics are reported honestly, not polished up.** Out-of-fold on 119
-samples: SVR R²=0.37, GPR R²=0.38, weighted ensemble R²=0.39, stacking
-ensemble R²=0.40 (exact numbers will shift slightly if you retrain -
-`models/saved_models/model_metadata.json` has the current run's values).
-That's a modest fit for a genuinely small dataset with a narrow
-experimental design, evaluated properly out-of-sample. Nothing here is
-tuned to make that number look better than it is.
+**Metrics are reported honestly, not polished up.** As of the changes in
+this section, out-of-fold on 119 samples: R² ranges from 0.19 (the
+classical power-law baseline) up to 0.63 (Gradient Boosting / the 4-model
+stack) - see "Round 2" immediately below for the full comparison and how
+that range was arrived at. `models/saved_models/model_metadata.json` has
+the current run's exact values; they'll shift slightly on retraining.
+Nothing here is tuned to make any number look better than it is - see the
+CV-seed-variance finding below for why any single point estimate should
+be read with that in mind.
+
+## Round 2: investigating "how do we increase accuracy" empirically
+
+The changes above got the API and monitoring working against a real,
+if modest, model (R² around 0.37-0.40). Asked directly how to improve
+accuracy given the dataset/method/algorithm limitations, the useful
+answer turned out to require actually interrogating the dataset rather
+than reaching for generic advice. In order:
+
+**The dataset has 19 exact-duplicate design points.** It's a complete
+5x5x4 factorial DOE (100 unique `(Vc,Fz,ap)` combinations across 119
+rows), and 19 of those 100 were measured twice. The within-pair standard
+deviation of `Ra` for those 19 replicated points - pure measurement/
+process noise, since `Vc`/`Fz`/`ap` are identical within a pair and there's
+no input information to distinguish them - averages 0.257, against an
+overall `Ra` std of 0.401. That suggested a substantial fraction of total
+variance (roughly 70%, by a rough calculation) might be irreducible,
+implying a low ceiling on achievable R² no matter the model. **This
+estimate turned out to be too pessimistic** - see below - but the
+underlying technique (using replicated design points to estimate "pure
+error", standard in DOE/RSM analysis) is worth knowing, and the fact that
+it's based on only 19 pairs (each just n=2) means it has high sampling
+uncertainty of its own and shouldn't be taken as precise.
+
+**Checked whether the CV setup was leaking information through those
+replicates.** Plain `StratifiedKFold` doesn't know about the replicate
+structure and, at this project's default seed, splits 17 of the 19
+replicate pairs across train/test - meaning some "held-out" test points
+had an identical-input twin in the training fold. Tested this directly:
+re-evaluated SVR/GPR under `StratifiedGroupKFold` (grouping by exact
+`(Vc,Fz,ap)` identity, so replicates always land in the same fold)
+against the original `StratifiedKFold`, across 5 different CV seeds. The
+result was **not what a leakage-inflation hypothesis would predict**: SVR's
+R² was consistently *higher* under the leakage-safe grouped CV in every
+seed tested, not lower. The clearer and more robust finding from this
+experiment was that **R² on this dataset varies a lot** - from 0.24 to
+0.50 for the identical model and hyperparameters, changing only the CV
+random seed - which on its own says a single point-estimate R² (any of
+the ones quoted anywhere in this project, before or after this round of
+changes) carries real uncertainty just from having 119 samples.
+`StratifiedGroupKFold` is used throughout regardless of that inconclusive
+directional result, since it's the methodologically correct choice for a
+dataset with known exact replicates independent of which way it happens
+to move any particular number - see `create_replicate_groups()` in
+`src/tuning/optuna_tuning.py`.
+
+**Found and fixed a real syntax error while looking for other model
+options.** `src/models/{randomforest,xgboost,catboost,ensemble}.py`
+weren't just unimplemented (`NotImplementedError`) - they had an actual
+Python syntax error (an unterminated triple-quoted docstring: `"""Train a
+random forest model."` is missing two closing quote characters), so none
+of the four could even be imported, let alone run. Fixed the syntax in
+all four; implemented `randomforest.py` for real, left `xgboost.py`/
+`catboost.py` as clearly-documented stubs (adding those specific
+libraries as dependencies wasn't obviously worth it - see below), and
+pointed `ensemble.py` at where the actual ensembling logic lives.
+
+**The real finding: model family matters far more than anything else
+tried.** Built RandomForest, GradientBoosting (both via scikit-learn - no
+new dependencies), and a classical machining power-law model
+(`Ra = C * Vc^a * Fz^b * ap^c`, fit by OLS in log-space - the textbook
+Taguchi/RSM approach to exactly this problem, notably never tried in this
+project before). Compared all five model families on **identical**
+`StratifiedGroupKFold` folds for a fair side-by-side:
+
+| Model | R² (out-of-fold) | RMSE |
+|---|---|---|
+| PowerLaw | 0.19 | 0.360 |
+| SVR | 0.39 | 0.311 |
+| GPR | 0.41 | 0.308 |
+| RandomForest | 0.60 | 0.253 |
+| **GradientBoosting** | **0.63** | **0.242** |
+
+Random Forest and especially Gradient Boosting substantially outperform
+the SVR/GPR approach the original prototype exclusively used - a jump
+from R²~0.40 to R²~0.63, on the exact same 12 engineered features. The
+likely reason: this dataset's raw parameters each take only ~4-5 discrete
+values (the DOE grid again), which suits trees - which split on
+thresholds - more naturally than SVR/GPR's smooth global kernel/polynomial
+fit, and trees don't inherit the multicollinearity that comes from
+running `PolynomialFeatures` over an already-hand-engineered 12-feature
+set. **This is the actual answer to "how do I increase accuracy given
+these limitations": add the right model family, not more feature
+engineering or a fancier kernel for the models already in use.**
+
+A 4-model stacking ensemble (SVR + GPR + RandomForest + GradientBoosting,
+RidgeCV meta-learner) reaches R²=0.63, RMSE=0.242 - matching
+GradientBoosting alone almost exactly, meaning the stack isn't adding
+much beyond what GBM already captures on its own, but doesn't hurt either.
+A 5-model version that also included PowerLaw was tested and rejected: it
+added a small, hard-to-interpret *negative* meta-learner weight without
+improving stacked RMSE, so PowerLaw is trained, evaluated, and served
+standalone (`power_law_prediction` in the API, plus its fitted formula
+logged at training time) but excluded from the stacking input - see
+`STACKED_MODEL_KEYS` in `src/train/train.py`.
+
+`recommended_model` (used for `/predict`'s `recommended_prediction`) now
+picks the best out-of-fold RMSE across all seven candidates - the five
+individual models plus both ensembles - rather than assuming it's always
+one of the two ensembles. On the currently-shipped model, that's
+`GradientBoosting`.
+
+**Why RF/GBM's hyperparameters were tuned with the corrected CV from the
+start, while SVR/GPR's weren't re-tuned.** `tune_svr`/`tune_gpr` gained an
+optional `groups` parameter (defaults to `None`, preserving old behavior)
+so future full retrains use `StratifiedGroupKFold` throughout; the
+already-tuned SVR/GPR hyperparameters from before this round weren't
+recomputed, since re-tuning is expensive (tens of minutes at the `full`
+preset) and the CV-seed-variance finding above suggests the hyperparameters
+themselves are unlikely to be highly sensitive to this specific choice.
+The final reported metrics, the stacking meta-learner, and all RF/GBM
+tuning are all computed under the corrected grouped CV regardless.
+
+**Why XGBoost/CatBoost weren't added despite existing as stub files.**
+scikit-learn's `GradientBoostingRegressor` already captures the "boosted
+trees" approach and delivered the result above with zero new
+dependencies. XGBoost's/CatBoost's usual advantages (large-scale data,
+GPU training, native categorical handling) don't apply to 119 rows of
+all-continuous features. The stub files now explain this and point at
+`build_gbm_pipeline` if someone wants to add one of those libraries later
+anyway (e.g. for a much larger future dataset).
+
+**One important caveat that applies to every model here, not just the
+new ones.** All hyperparameter tuning (RF/GBM included) selects
+hyperparameters using the same CV split it then reports performance on.
+This is a mild, well-known source of optimism (the model has been
+selected, in part, to do well on exactly the folds being scored) and was
+already true of the original SVR/GPR tuning before this round of
+changes - a fully nested CV (an outer loop the hyperparameter search
+never sees) would remove it but wasn't implemented here, consistent with
+the original design. Worth knowing if reporting these numbers externally.
 
 ## Explicitly not touched
 
@@ -179,15 +364,16 @@ tuned to make that number look better than it is.
   actual data (`feed_rate`/`spindle_speed` vs. the real `Vc`/`Fz`). Left
   alone rather than guessing at intent for something outside what was asked.
 - **`src/preprocessing/{clean,engineer,utils}.py`, `src/models/{ensemble,
-  catboost,randomforest,xgboost}.py`, `src/utils/{config_loader,logger}.py`**
-  - pre-existing `NotImplementedError` stubs, not on any import path the
-  API, training script, or monitor uses. Left as future-extension points.
-- **Permutation feature importance** - present in `Untitled-2.py` but
-  fragile (string-matching polynomial feature names back to their
-  original variable) and not part of what was asked for. A clean
-  `/model/feature-importance` endpoint built on `sklearn.inspection.
-  permutation_importance` against the final fitted models would be a
-  reasonable follow-up.
+  catboost,xgboost}.py`, `src/utils/{config_loader,logger}.py`** -
+  pre-existing `NotImplementedError` stubs (`randomforest.py` used to be
+  one too, but is now a real implementation - see "Round 2" above, which
+  also covers a syntax error found and fixed across all four `src/models/`
+  files listed there). Not on any import path the API, training script, or
+  monitor uses. Left as future-extension points.
+- **Permutation feature importance was initially left as a follow-up, then
+  implemented anyway** - see "What's new" above for why it turned out to
+  be straightforward once approached at the pipeline level instead of the
+  polynomial-expanded feature level.
 - **`src/utils/pokayoke.py`** (`validate_input`) - existed but was unused
   anywhere. Wired into `src/train/train.py` as a sanity check (no nulls,
   no negative machining parameters) on the raw loaded data before feature

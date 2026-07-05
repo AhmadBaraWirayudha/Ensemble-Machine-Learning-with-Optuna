@@ -25,7 +25,7 @@ COPY models/ ./models/
 # logs/ and reports/ are created on demand by src/config.py at import
 # time, but declaring them here means they exist (and are volume-mountable)
 # even before the app has written anything.
-RUN mkdir -p logs reports/drift reports/metrics reports/figures
+RUN mkdir -p logs reports/drift reports/metrics reports/figures reports/feature_importance models/saved_models/archive
 
 EXPOSE 8000
 

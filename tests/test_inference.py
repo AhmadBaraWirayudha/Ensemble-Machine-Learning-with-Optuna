@@ -20,6 +20,7 @@ def test_predict_all_returns_all_models(bundle):
 
     for key in [
         "svr_prediction", "gpr_prediction", "gpr_uncertainty_std",
+        "rf_prediction", "gbm_prediction", "power_law_prediction",
         "weighted_ensemble_prediction", "stacking_ensemble_prediction",
         "recommended_model", "recommended_prediction",
     ]:
@@ -40,10 +41,17 @@ def test_predict_all_is_deterministic(bundle):
 def test_recommended_prediction_matches_recommended_model(bundle):
     result = predict_all(bundle, vc=10.0, fz=0.1, ap=1.0)
 
-    if result["recommended_model"] == "Weighted_Ensemble":
-        assert result["recommended_prediction"] == result["weighted_ensemble_prediction"]
-    else:
-        assert result["recommended_prediction"] == result["stacking_ensemble_prediction"]
+    key_by_name = {
+        "SVR": "svr_prediction",
+        "GPR": "gpr_prediction",
+        "RandomForest": "rf_prediction",
+        "GradientBoosting": "gbm_prediction",
+        "PowerLaw": "power_law_prediction",
+        "Weighted_Ensemble": "weighted_ensemble_prediction",
+        "Stacking_Ensemble": "stacking_ensemble_prediction",
+    }
+    expected_key = key_by_name[result["recommended_model"]]
+    assert result["recommended_prediction"] == result[expected_key]
 
 
 def test_check_input_range_in_envelope(baseline):

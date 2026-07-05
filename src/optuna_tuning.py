@@ -7,14 +7,20 @@ here so `from src.optuna_tuning import tune_svr` etc. keep working.
 
 from src.tuning.optuna_tuning import (
     create_stratified_bins,
+    create_replicate_groups,
     tune_svr,
     tune_gpr,
+    tune_rf,
+    tune_gbm,
     optimize_ensemble_weight,
 )
 
 __all__ = [
     "create_stratified_bins",
+    "create_replicate_groups",
     "tune_svr",
     "tune_gpr",
+    "tune_rf",
+    "tune_gbm",
     "optimize_ensemble_weight",
 ]

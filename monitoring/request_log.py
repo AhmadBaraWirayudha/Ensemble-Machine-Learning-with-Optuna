@@ -1,6 +1,6 @@
 """
 Append-only JSONL log of every prediction the API has served. One JSON
-object per line: raw inputs, all four model outputs, and whether the
+object per line: raw inputs, every model's output, and whether the
 request fell inside the training envelope.
 
 This is deliberately a flat file rather than a database - it's the
@@ -32,6 +32,9 @@ def log_prediction(vc: float, fz: float, ap: float, prediction: dict, log_path=N
         "ap": ap,
         "svr_prediction": prediction.get("svr_prediction"),
         "gpr_prediction": prediction.get("gpr_prediction"),
+        "rf_prediction": prediction.get("rf_prediction"),
+        "gbm_prediction": prediction.get("gbm_prediction"),
+        "power_law_prediction": prediction.get("power_law_prediction"),
         "weighted_ensemble_prediction": prediction.get("weighted_ensemble_prediction"),
         "stacking_ensemble_prediction": prediction.get("stacking_ensemble_prediction"),
         "recommended_model": prediction.get("recommended_model"),

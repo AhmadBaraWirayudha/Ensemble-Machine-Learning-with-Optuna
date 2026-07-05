@@ -7,12 +7,20 @@ independently testable/reusable.
 
 from src.features import build_feature_row
 
+# Must match src.train.train.STACKED_MODEL_KEYS's *order* - the stacking
+# meta-learner was fit on a column stack in this exact order, so serving
+# has to reproduce it exactly or the meta-learner's weights get applied to
+# the wrong model's prediction.
+_STACKING_INPUT_ORDER = ["svr_prediction", "gpr_prediction", "rf_prediction", "gbm_prediction"]
+
 
 def predict_all(bundle, vc: float, fz: float, ap: float) -> dict:
     """
-    Run all four models (SVR, GPR, weighted ensemble, stacking ensemble)
-    on one raw (Vc, Fz, ap) machining-parameter point and return every
-    prediction plus which one the training run recommends as "the" answer.
+    Run every model in the bundle (SVR, GPR, RandomForest,
+    GradientBoosting, PowerLaw, the SVR+GPR weighted ensemble, and the
+    SVR+GPR+RF+GBM stacking ensemble) on one raw (Vc, Fz, ap) point and
+    return every prediction, plus whichever the training run recommends
+    as "the" answer (recommended_prediction).
     """
 
     row = build_feature_row(vc, fz, ap, bundle["feature_columns"])
@@ -23,20 +31,37 @@ def predict_all(bundle, vc: float, fz: float, ap: float) -> dict:
     gpr_pred = float(gpr_pred_arr[0])
     gpr_std = float(gpr_std_arr[0])
 
+    rf_pred = float(bundle["rf_model"].predict(row)[0])
+    gbm_pred = float(bundle["gbm_model"].predict(row)[0])
+    power_law_pred = float(bundle["power_law_model"].predict(row)[0])
+
     alpha = bundle["best_alpha"]
     weighted_pred = alpha * gpr_pred + (1 - alpha) * svr_pred
 
-    stacking_pred = float(bundle["meta_model"].predict([[svr_pred, gpr_pred]])[0])
+    stacking_inputs = {"svr_prediction": svr_pred, "gpr_prediction": gpr_pred, "rf_prediction": rf_pred, "gbm_prediction": gbm_pred}
+    stacking_row = [[stacking_inputs[name] for name in _STACKING_INPUT_ORDER]]
+    stacking_pred = float(bundle["meta_model"].predict(stacking_row)[0])
+
+    predictions_by_name = {
+        "SVR": svr_pred,
+        "GPR": gpr_pred,
+        "RandomForest": rf_pred,
+        "GradientBoosting": gbm_pred,
+        "PowerLaw": power_law_pred,
+        "Weighted_Ensemble": weighted_pred,
+        "Stacking_Ensemble": stacking_pred,
+    }
 
     recommended_model = bundle["recommended_model"]
-    recommended_value = (
-        weighted_pred if recommended_model == "Weighted_Ensemble" else stacking_pred
-    )
+    recommended_value = predictions_by_name[recommended_model]
 
     return {
         "svr_prediction": svr_pred,
         "gpr_prediction": gpr_pred,
         "gpr_uncertainty_std": gpr_std,
+        "rf_prediction": rf_pred,
+        "gbm_prediction": gbm_pred,
+        "power_law_prediction": power_law_pred,
         "weighted_ensemble_prediction": weighted_pred,
         "ensemble_alpha": float(alpha),
         "stacking_ensemble_prediction": stacking_pred,

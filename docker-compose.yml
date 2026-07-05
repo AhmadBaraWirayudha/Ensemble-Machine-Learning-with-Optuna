@@ -3,6 +3,12 @@ services:
     build: .
     ports:
       - "8000:8000"
+    # Optional: set CNC_API_KEY to require it (as an X-API-Key header) on
+    # every data endpoint. Unset (default) means the API is open - fine
+    # for a trusted internal network, not otherwise. Uncomment and set a
+    # long random value to turn this on:
+    # environment:
+    #   - CNC_API_KEY=change-me-to-a-long-random-string
     volumes:
       # Mount over the baked-in model so a retrained bundle (produced by
       # `python scripts/train_model.py` on the host, or by `docker compose

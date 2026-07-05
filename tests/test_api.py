@@ -26,7 +26,10 @@ def test_health(client):
     body = r.json()
     assert body["status"] == "ok"
     assert body["model_loaded"] is True
-    assert body["recommended_model"] in ("Weighted_Ensemble", "Stacking_Ensemble")
+    assert body["recommended_model"] in (
+        "SVR", "GPR", "RandomForest", "GradientBoosting", "PowerLaw",
+        "Weighted_Ensemble", "Stacking_Ensemble",
+    )
 
 
 def test_model_info(client):
@@ -35,6 +38,15 @@ def test_model_info(client):
     body = r.json()
     assert "metrics" in body
     assert "feature_columns" in body
+
+
+def test_model_feature_importance(client):
+    r = client.get("/model/feature-importance")
+    assert r.status_code == 200
+    body = r.json()
+    assert "detailed" in body
+    assert "by_variable" in body
+    assert set(body["by_variable"].keys()) == {"Vc", "Fz", "ap"}
 
 
 def test_predict_valid_input(client):
@@ -96,3 +108,14 @@ def test_drift_report_runs_once_enough_traffic_logged(client):
     body = r.json()
     assert "overall_verdict" in body
     assert body["n_current_samples"] == 35
+
+
+def test_retrain_history_empty_by_default(client, tmp_path, monkeypatch):
+    import monitoring.retrain_trigger as rt
+    monkeypatch.setattr(rt, "RETRAIN_LOG_PATH", tmp_path / "no_such_retrain_log.jsonl")
+
+    r = client.get("/retrain/history")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 0
+    assert body["events"] == []

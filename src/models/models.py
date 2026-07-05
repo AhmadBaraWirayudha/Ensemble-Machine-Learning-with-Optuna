@@ -15,6 +15,7 @@ from sklearn.gaussian_process.kernels import (
 )
 
 from sklearn.compose import TransformedTargetRegressor
+from sklearn.ensemble import GradientBoostingRegressor
 
 from src.config import POLY_DEGREE
 
@@ -106,3 +107,33 @@ def build_gpr_pipeline(
     ])
 
     return pipeline
+
+
+def build_gbm_pipeline(
+    n_estimators=200,
+    max_depth=3,
+    learning_rate=0.05,
+    subsample=1.0,
+    min_samples_leaf=1,
+    random_state=151101
+):
+    """
+    Build a Gradient Boosting pipeline - like build_rf_pipeline, on the 12
+    engineered features directly with no PolynomialFeatures step, for the
+    same reason (boosted trees capture nonlinearity/interactions via
+    splits, not via an explicit polynomial expansion of the inputs).
+    """
+
+    return Pipeline([
+        (
+            "gbm",
+            GradientBoostingRegressor(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                learning_rate=learning_rate,
+                subsample=subsample,
+                min_samples_leaf=min_samples_leaf,
+                random_state=random_state,
+            )
+        )
+    ])

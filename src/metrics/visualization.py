@@ -135,7 +135,9 @@ def plot_model_comparison(
 
 
 def plot_feature_importance(
-    importance_df: pd.DataFrame
+    importance_df: pd.DataFrame,
+    title="Feature Importance",
+    filename="feature_importance.png"
 ):
 
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -146,7 +148,7 @@ def plot_feature_importance(
     )
 
     ax.set_title(
-        "Feature Importance"
+        title
     )
 
     ax.set_ylabel(
@@ -161,5 +163,5 @@ def plot_feature_importance(
 
     save_figure(
         fig,
-        "feature_importance.png"
+        filename
     )

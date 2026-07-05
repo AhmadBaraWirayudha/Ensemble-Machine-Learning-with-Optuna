@@ -43,9 +43,21 @@ MODEL_METADATA_PATH = SAVED_MODEL_DIR / "model_metadata.json"
 # needing to unpickle the model bundle.
 BASELINE_DATA_PATH = SAVED_MODEL_DIR / "training_baseline.csv"
 
+# Permutation importance results (per-engineered-feature and rolled up to
+# Vc/Fz/ap), computed once at training time and served as-is by the API
+# rather than recomputed per request - see src/metrics/feature_importance.py.
+FEATURE_IMPORTANCE_PATH = SAVED_MODEL_DIR / "feature_importance.json"
+
 # Where the API appends every prediction request it serves, one JSON object
 # per line. The drift monitor can read this as its "production data" source.
 PREDICTION_LOG_PATH = LOG_DIR / "prediction_log.jsonl"
+
+# Where monitoring/retrain_trigger.py backs up the previous model bundle
+# before an auto-retrain overwrites it, so a regression can be rolled back.
+MODEL_ARCHIVE_DIR = SAVED_MODEL_DIR / "archive"
+
+# JSONL log of retrain attempts triggered by monitoring/retrain_trigger.py
+RETRAIN_LOG_PATH = LOG_DIR / "retrain_log.jsonl"
 
 # =========================================================
 # RANDOMNESS
@@ -85,3 +97,4 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 SAVED_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DRIFT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)

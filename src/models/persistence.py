@@ -20,19 +20,29 @@ from src.config import (
     MODEL_BUNDLE_PATH,
     MODEL_METADATA_PATH,
     BASELINE_DATA_PATH,
+    FEATURE_IMPORTANCE_PATH,
 )
 
-BUNDLE_FORMAT_VERSION = 1
+BUNDLE_FORMAT_VERSION = 2
+
+# Keys in the bundle dict that are fitted model objects rather than
+# JSON-serializable metadata - excluded when writing model_metadata.json.
+_MODEL_OBJECT_KEYS = ("svr_model", "gpr_model", "rf_model", "gbm_model", "power_law_model", "meta_model")
 
 
 def save_model_bundle(
     svr_model,
     gpr_model,
+    rf_model,
+    gbm_model,
+    power_law_model,
     meta_model,
     best_alpha,
     feature_columns,
     svr_params,
     gpr_params,
+    rf_params,
+    gbm_params,
     metrics,
     recommended_model,
     training_df,
@@ -49,6 +59,15 @@ def save_model_bundle(
       - model_bundle.joblib   fitted sklearn objects the API loads
       - model_metadata.json   human-readable copy of the metrics/params
       - training_baseline.csv cleaned raw training data, for drift checks
+
+    Format version 2: adds rf_model/gbm_model/power_law_model alongside
+    the original svr_model/gpr_model, following the finding (see
+    UPGRADE_NOTES.md) that tree-based models substantially outperform
+    SVR/GPR on this dataset. meta_model (the stacking ensemble) is fit
+    over svr_model + gpr_model + rf_model + gbm_model - power_law_model is
+    still saved and served standalone (it's a genuinely useful
+    interpretable baseline) but isn't a stacking input; see
+    src/train/train.py's STACKED_MODEL_KEYS docstring for why.
     """
 
     bundle_path = bundle_path or MODEL_BUNDLE_PATH
@@ -61,11 +80,16 @@ def save_model_bundle(
         "format_version": BUNDLE_FORMAT_VERSION,
         "svr_model": svr_model,
         "gpr_model": gpr_model,
+        "rf_model": rf_model,
+        "gbm_model": gbm_model,
+        "power_law_model": power_law_model,
         "meta_model": meta_model,
         "best_alpha": float(best_alpha),
         "feature_columns": list(feature_columns),
         "svr_params": svr_params,
         "gpr_params": gpr_params,
+        "rf_params": rf_params,
+        "gbm_params": gbm_params,
         "metrics": metrics,
         "recommended_model": recommended_model,
         "trained_at": trained_at,
@@ -76,7 +100,7 @@ def save_model_bundle(
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, bundle_path)
 
-    metadata = {k: v for k, v in bundle.items() if k not in ("svr_model", "gpr_model", "meta_model")}
+    metadata = {k: v for k, v in bundle.items() if k not in _MODEL_OBJECT_KEYS}
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2, default=str)
@@ -125,3 +149,37 @@ def load_baseline_data(baseline_path=None) -> pd.DataFrame:
         )
 
     return pd.read_csv(baseline_path)
+
+
+def save_feature_importance(detailed, by_variable, path=None):
+    """
+    Persist permutation importance results (see
+    src/metrics/feature_importance.py) as JSON: {"detailed": {feature:
+    {model: value}}, "by_variable": {variable: {model: value}}}.
+    """
+
+    path = path or FEATURE_IMPORTANCE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "detailed": detailed.to_dict(orient="index"),
+        "by_variable": by_variable.to_dict(orient="index"),
+    }
+
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    return path
+
+
+def load_feature_importance(path=None) -> dict:
+    path = path or FEATURE_IMPORTANCE_PATH
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No feature importance results found at {path}. "
+            "Run `python scripts/train_model.py` first."
+        )
+
+    with open(path) as f:
+        return json.load(f)

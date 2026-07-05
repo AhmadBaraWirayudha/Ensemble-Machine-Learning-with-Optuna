@@ -19,7 +19,10 @@ tests/
 ├── test_persistence.py    (new: model bundle save/load)
 ├── test_inference.py      (new: prediction helper used by the API)
 ├── test_api.py            (new: FastAPI endpoints)
+├── test_auth.py                (new: opt-in API key authentication)
 ├── test_drift_monitor.py  (new: PSI/KS drift statistics)
+├── test_feature_importance.py  (new: permutation importance)
+├── test_retrain_trigger.py     (new: auto-retrain backup/promote/rollback)
 └── README.md
 ```
 
@@ -35,8 +38,11 @@ tests/
 | `test_evaluation.py` | Metrics validation |
 | `test_persistence.py` | Model bundle save/load round-trips correctly |
 | `test_inference.py` | Prediction helper returns sane, deterministic outputs |
-| `test_api.py` | API endpoints: health, predict, batch, validation, drift report |
+| `test_api.py` | API endpoints: health, predict, batch, validation, drift report, retrain history |
+| `test_auth.py` | Auth is off by default; when `CNC_API_KEY` is set, every data endpoint requires it and `/health` never does |
 | `test_drift_monitor.py` | PSI/KS drift statistics behave correctly on known distributions |
+| `test_feature_importance.py` | Permutation importance ranks a known-informative feature correctly |
+| `test_retrain_trigger.py` | Backup/restore round-trip, and promote-vs-rollback decision logic (training itself is mocked out so these run in ~1s instead of minutes) |
 
 Most of these tests run against real artifacts (the actual training CSV,
 an actual trained model bundle) rather than mocks, matching how the
@@ -50,7 +56,9 @@ original tests in this directory were written. `test_persistence.py` and
 **Prerequisite:** `test_persistence.py`, `test_inference.py`, and the
 model-dependent parts of `test_api.py` need a trained model to already
 exist. Run `python scripts/train_model.py` once before testing if
-`models/saved_models/` is empty.
+`models/saved_models/` is empty. `test_retrain_trigger.py` mocks out
+`src.train.main` entirely, so it doesn't need this and doesn't take
+minutes to run.
 
 ---
 

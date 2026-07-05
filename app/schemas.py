@@ -36,11 +36,14 @@ class PredictionResponse(BaseModel):
     svr_prediction: float = Field(..., description="Predicted Ra (surface roughness, um) from the SVR model")
     gpr_prediction: float = Field(..., description="Predicted Ra from the Gaussian Process model")
     gpr_uncertainty_std: float = Field(..., description="GPR's predictive standard deviation at this point")
+    rf_prediction: float = Field(..., description="Predicted Ra from the Random Forest model")
+    gbm_prediction: float = Field(..., description="Predicted Ra from the Gradient Boosting model")
+    power_law_prediction: float = Field(..., description="Predicted Ra from the classical Ra=C*Vc^a*Fz^b*ap^c power-law model")
     weighted_ensemble_prediction: float = Field(..., description="alpha*GPR + (1-alpha)*SVR")
     ensemble_alpha: float
-    stacking_ensemble_prediction: float = Field(..., description="RidgeCV meta-learner over [SVR, GPR]")
+    stacking_ensemble_prediction: float = Field(..., description="RidgeCV meta-learner over [SVR, GPR, RandomForest, GradientBoosting]")
 
-    recommended_model: str = Field(..., description="Which ensemble had the better out-of-fold RMSE at training time")
+    recommended_model: str = Field(..., description="Whichever candidate (including individual models) had the best out-of-fold RMSE at training time")
     recommended_prediction: float = Field(..., description="Prediction from recommended_model - use this one if you just want a single number")
 
     range_check: RangeCheck
@@ -63,3 +66,4 @@ class HealthResponse(BaseModel):
     recommended_model: Optional[str] = None
     model_trained_at: Optional[str] = None
     n_train_samples: Optional[int] = None
+    auth_enabled: bool = False
