@@ -31,12 +31,15 @@ def parse_args():
     parser.add_argument("--preset", choices=list(PRESETS), default="quick", help="Trial-count/search-space preset (default: quick)")
     parser.add_argument("--svr-trials", type=int, default=None, help="Override SVR Optuna trial count")
     parser.add_argument("--gpr-trials", type=int, default=None, help="Override GPR Optuna trial count")
+    parser.add_argument("--rf-trials", type=int, default=None, help="Override RandomForest Optuna trial count")
+    parser.add_argument("--gbm-trials", type=int, default=None, help="Override GradientBoosting Optuna trial count")
     parser.add_argument("--ensemble-trials", type=int, default=None, help="Override ensemble-weight Optuna trial count")
     parser.add_argument("--max-poly-degree", type=int, default=None, choices=[2, 3, 4], help="Override max PolynomialFeatures degree searched for SVR")
     parser.add_argument("--n-splits", type=int, default=None, help="Override CV fold count (default: 5)")
     parser.add_argument("--random-state", type=int, default=None, help="Override random seed (default: 151101)")
     parser.add_argument("--no-pruning", action="store_true", help="Disable Optuna median pruning of unpromising trials")
     parser.add_argument("--no-plots", action="store_true", help="Skip generating report plots")
+    parser.add_argument("--no-importance", action="store_true", help="Skip permutation importance computation")
     parser.add_argument("--no-save", action="store_true", help="Don't persist the model bundle (dry run / metrics only)")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress logging")
     return parser.parse_args()
@@ -49,6 +52,8 @@ def main():
         preset=args.preset,
         svr_trials=args.svr_trials,
         gpr_trials=args.gpr_trials,
+        rf_trials=args.rf_trials,
+        gbm_trials=args.gbm_trials,
         ensemble_trials=args.ensemble_trials,
         max_poly_degree=args.max_poly_degree,
         n_splits=args.n_splits,
@@ -56,15 +61,15 @@ def main():
         use_pruning=not args.no_pruning,
         save=not args.no_save,
         make_plots=not args.no_plots,
+        compute_importance=not args.no_importance,
         verbose=not args.quiet,
     )
 
     print("\n=== Summary ===")
     print(f"Recommended model : {result['recommended_model']}")
-    print(f"Weighted RMSE     : {result['metrics']['Weighted_Ensemble']['RMSE']:.4f}")
-    print(f"Weighted R2       : {result['metrics']['Weighted_Ensemble']['R2']:.4f}")
-    print(f"Stacking RMSE     : {result['metrics']['Stacking_Ensemble']['RMSE']:.4f}")
-    print(f"Stacking R2       : {result['metrics']['Stacking_Ensemble']['R2']:.4f}")
+    for name, m in result["metrics"].items():
+        marker = " <-- recommended" if name == result["recommended_model"] else ""
+        print(f"{name:18s} RMSE={m['RMSE']:.4f}  R2={m['R2']:.4f}{marker}")
     if "bundle_path" in result:
         print(f"Model bundle      : {result['bundle_path']}")
 
