@@ -1,15 +1,15 @@
 import pytest
 from fastapi.testclient import TestClient
 
-import monitoring.request_log as request_log_module
+import monitoring.storage as storage_module
 from app.main import app
 from app.auth import API_KEY_ENV_VAR
 
 
 @pytest.fixture(autouse=True)
 def isolated_prediction_log(tmp_path, monkeypatch):
-    """Same isolation as test_api.py - avoid polluting the real prediction log."""
-    monkeypatch.setattr(request_log_module, "PREDICTION_LOG_PATH", tmp_path / "test_prediction_log.jsonl")
+    """Same isolation as test_api.py - avoid polluting the real production DB."""
+    monkeypatch.setattr(storage_module, "DB_PATH", tmp_path / "test_production.db")
     yield
 
 
@@ -73,6 +73,8 @@ def test_protected_endpoint_accepts_correct_key(client, monkeypatch):
     ("get", "/model/feature-importance", None),
     ("post", "/predict", {"Vc": 10.0, "Fz": 0.1, "ap": 1.0}),
     ("post", "/predict/batch", {"items": [{"Vc": 10.0, "Fz": 0.1, "ap": 1.0}]}),
+    ("post", "/measurements", {"Ra_measured": 0.5, "job_id": "PART-X"}),
+    ("get", "/accuracy/report", None),
     ("get", "/drift/report", None),
     ("get", "/retrain/history", None),
 ])

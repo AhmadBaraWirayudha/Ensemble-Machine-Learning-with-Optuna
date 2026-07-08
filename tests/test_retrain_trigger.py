@@ -4,12 +4,14 @@ import sys
 import pytest
 
 import monitoring.retrain_trigger as rt
+import monitoring.storage as storage_module
+from monitoring.storage import log_retrain_event, read_retrain_log
 
 
 @pytest.fixture()
 def isolated_model_dir(tmp_path, monkeypatch):
     """Redirect every path retrain_trigger touches into tmp_path, so tests
-    never read/write the real trained model."""
+    never read/write the real trained model or the real production DB."""
 
     saved_model_dir = tmp_path / "saved_models"
     archive_dir = saved_model_dir / "archive"
@@ -18,7 +20,7 @@ def isolated_model_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(rt, "SAVED_MODEL_DIR", saved_model_dir)
     monkeypatch.setattr(rt, "MODEL_ARCHIVE_DIR", archive_dir)
     monkeypatch.setattr(rt, "MODEL_BUNDLE_PATH", saved_model_dir / "model_bundle.joblib")
-    monkeypatch.setattr(rt, "RETRAIN_LOG_PATH", tmp_path / "retrain_log.jsonl")
+    monkeypatch.setattr(storage_module, "DB_PATH", tmp_path / "test_production.db")
 
     return saved_model_dir
 
@@ -60,16 +62,16 @@ def test_get_recommended_rmse():
     assert rt.get_recommended_rmse(metadata) == 0.31
 
 
-def test_log_retrain_event_appends_jsonl(isolated_model_dir, tmp_path):
-    log_path = tmp_path / "retrain_log.jsonl"
-    rt.log_retrain_event({"action": "skipped", "reason": "no_drift"}, log_path=log_path)
-    rt.log_retrain_event({"action": "promoted"}, log_path=log_path)
+def test_log_retrain_event_round_trips_through_sqlite(isolated_model_dir):
+    log_retrain_event({"action": "skipped", "reason": "no_drift"})
+    log_retrain_event({"action": "promoted", "old_rmse": 0.3, "new_rmse": 0.24})
 
-    lines = log_path.read_text().strip().split("\n")
-    assert len(lines) == 2
-    assert json.loads(lines[0])["action"] == "skipped"
-    assert json.loads(lines[1])["action"] == "promoted"
-    assert "timestamp" in json.loads(lines[0])
+    events = read_retrain_log()
+    assert len(events) == 2
+    assert events[0]["action"] == "skipped"
+    assert events[1]["action"] == "promoted"
+    assert events[1]["new_rmse"] == 0.24
+    assert "timestamp" in events[0]
 
 
 @pytest.fixture()
@@ -104,8 +106,8 @@ def test_skips_when_no_drift(cli_environment, monkeypatch):
     exit_code = _run_cli(monkeypatch, ["--quiet"], drift_verdict="STABLE")
     assert exit_code == 0
 
-    log_lines = (cli_environment / "retrain_log.jsonl").read_text().strip().split("\n")
-    assert json.loads(log_lines[-1])["action"] == "skipped"
+    events = read_retrain_log()
+    assert events[-1]["action"] == "skipped"
     # model file should be untouched (still says "old")
     assert (cli_environment / "saved_models" / "model_bundle.joblib").read_text() == "bundle-old"
 
@@ -115,8 +117,8 @@ def test_promotes_improved_model(cli_environment, monkeypatch, isolated_model_di
     exit_code = _run_cli(monkeypatch, ["--quiet"], drift_verdict="DRIFT_DETECTED", new_rmse=0.20)
     assert exit_code == 0
 
-    log_lines = (cli_environment / "retrain_log.jsonl").read_text().strip().split("\n")
-    last_event = json.loads(log_lines[-1])
+    events = read_retrain_log()
+    last_event = events[-1]
     assert last_event["action"] == "promoted"
     assert last_event["new_rmse"] == 0.20
 
@@ -131,8 +133,8 @@ def test_rolls_back_regressed_model(cli_environment, monkeypatch, isolated_model
     exit_code = _run_cli(monkeypatch, ["--quiet"], drift_verdict="DRIFT_DETECTED", new_rmse=0.50)
     assert exit_code == 1
 
-    log_lines = (cli_environment / "retrain_log.jsonl").read_text().strip().split("\n")
-    last_event = json.loads(log_lines[-1])
+    events = read_retrain_log()
+    last_event = events[-1]
     assert last_event["action"] == "rolled_back"
 
     # NOTE: src.train.main is mocked, so it never actually wrote new files -
@@ -146,8 +148,8 @@ def test_dry_run_does_not_retrain_or_modify_files(cli_environment, monkeypatch, 
     exit_code = _run_cli(monkeypatch, ["--dry-run", "--quiet"], drift_verdict="DRIFT_DETECTED")
     assert exit_code == 0
 
-    log_lines = (cli_environment / "retrain_log.jsonl").read_text().strip().split("\n")
-    assert json.loads(log_lines[-1])["action"] == "dry_run"
+    events = read_retrain_log()
+    assert events[-1]["action"] == "dry_run"
     assert (isolated_model_dir / "model_bundle.joblib").read_text() == "bundle-old"
     archive_dir = isolated_model_dir / "archive"
     assert not archive_dir.exists() or list(archive_dir.iterdir()) == []

@@ -23,14 +23,14 @@ RMSE. If it's more than --max-regression-pct worse, the old bundle is
 restored from that backup rather than promoting a worse model - an
 automated pipeline silently deploying a regression is worse than it doing
 nothing, especially for a quality-prediction model. Every attempt (skipped,
-promoted, or rolled back) is appended to logs/retrain_log.jsonl.
+promoted, or rolled back) is recorded in the retrain_events table of
+logs/production.db (see monitoring/storage.py).
 
 Exit codes: 0 = no action needed / retrain promoted successfully,
 1 = retrained but rolled back a regression, 2 = error.
 """
 
 import argparse
-import json
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -44,11 +44,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import (
     SAVED_MODEL_DIR,
     MODEL_ARCHIVE_DIR,
-    RETRAIN_LOG_PATH,
     MODEL_BUNDLE_PATH,
 )
 from src.models.persistence import load_metadata, load_baseline_data
 from monitoring.drift_monitor import analyze_drift, read_prediction_log, MIN_SAMPLES
+from monitoring.storage import log_retrain_event, read_retrain_log
 
 ARCHIVED_FILENAMES = [
     "model_bundle.joblib",
@@ -89,36 +89,6 @@ def restore_from_backup(archive_path: Path) -> None:
 
 def get_recommended_rmse(metadata: dict) -> float:
     return metadata["metrics"][metadata["recommended_model"]]["RMSE"]
-
-
-def log_retrain_event(record: dict, log_path=None) -> None:
-    log_path = log_path or RETRAIN_LOG_PATH
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    record = {"timestamp": datetime.now(timezone.utc).isoformat(), **record}
-    with open(log_path, "a") as f:
-        f.write(json.dumps(record) + "\n")
-
-
-def read_retrain_log(log_path=None) -> list:
-    """Read logs/retrain_log.jsonl back as a list of dicts, most recent
-    last. Returns an empty list if nothing's been logged yet - a fresh
-    deployment with no retrain history is a normal state, not an error."""
-
-    log_path = log_path or RETRAIN_LOG_PATH
-    if not log_path.exists():
-        return []
-
-    events = []
-    with open(log_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return events
 
 
 def parse_args():

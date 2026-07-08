@@ -59,6 +59,14 @@ MODEL_ARCHIVE_DIR = SAVED_MODEL_DIR / "archive"
 # JSONL log of retrain attempts triggered by monitoring/retrain_trigger.py
 RETRAIN_LOG_PATH = LOG_DIR / "retrain_log.jsonl"
 
+# SQLite database - the real production data store as of the IoT/FreeCAD
+# integration round (see UPGRADE_NOTES.md). Predictions, physical
+# measurements (e.g. from a roughness tester), and retrain events all live
+# here now; PREDICTION_LOG_PATH/RETRAIN_LOG_PATH above are kept only as a
+# one-time migration source for anyone upgrading from the JSONL version
+# (see scripts/migrate_jsonl_to_sqlite.py), not written to going forward.
+DB_PATH = LOG_DIR / "production.db"
+
 # =========================================================
 # RANDOMNESS
 # =========================================================

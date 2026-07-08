@@ -1,16 +1,16 @@
 import pytest
 from fastapi.testclient import TestClient
 
-import monitoring.request_log as request_log_module
+import monitoring.storage as storage_module
 from app.main import app
 
 
 @pytest.fixture(autouse=True)
 def isolated_prediction_log(tmp_path, monkeypatch):
-    """Redirect the prediction log to a temp file so running this test
-    suite doesn't pollute the real logs/prediction_log.jsonl (which the
-    drift monitor treats as real production traffic)."""
-    monkeypatch.setattr(request_log_module, "PREDICTION_LOG_PATH", tmp_path / "test_prediction_log.jsonl")
+    """Redirect the production database to a temp file so running this
+    test suite doesn't pollute the real logs/production.db (which the
+    drift monitor and accuracy report treat as real production traffic)."""
+    monkeypatch.setattr(storage_module, "DB_PATH", tmp_path / "test_production.db")
     yield
 
 
@@ -110,10 +110,54 @@ def test_drift_report_runs_once_enough_traffic_logged(client):
     assert body["n_current_samples"] == 35
 
 
-def test_retrain_history_empty_by_default(client, tmp_path, monkeypatch):
-    import monitoring.retrain_trigger as rt
-    monkeypatch.setattr(rt, "RETRAIN_LOG_PATH", tmp_path / "no_such_retrain_log.jsonl")
+def test_predict_returns_and_echoes_job_id(client):
+    r = client.post("/predict", json={"Vc": 10.0, "Fz": 0.1, "ap": 1.0, "job_id": "PART-1"})
+    assert r.status_code == 200
+    assert r.json()["job_id"] == "PART-1"
 
+
+def test_predict_auto_generates_job_id_when_omitted(client):
+    r = client.post("/predict", json={"Vc": 10.0, "Fz": 0.1, "ap": 1.0})
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+    assert job_id  # non-empty
+    # a second call without job_id gets a *different* auto-generated one
+    r2 = client.post("/predict", json={"Vc": 10.0, "Fz": 0.1, "ap": 1.0})
+    assert r2.json()["job_id"] != job_id
+
+
+def test_submit_measurement(client):
+    r = client.post("/measurements", json={"Ra_measured": 0.75, "job_id": "PART-2", "device": "TIME3233"})
+    assert r.status_code == 200
+    assert r.json() == {"status": "recorded", "job_id": "PART-2"}
+
+
+def test_submit_measurement_rejects_non_positive_ra(client):
+    r = client.post("/measurements", json={"Ra_measured": -1.0, "job_id": "PART-3"})
+    assert r.status_code == 422
+
+
+def test_accuracy_report_insufficient_data_by_default(client):
+    r = client.get("/accuracy/report")
+    assert r.status_code == 200
+    assert r.json()["status"] == "insufficient_data"
+
+
+def test_accuracy_report_matches_predict_and_measurement_by_job_id(client):
+    pred = client.post("/predict", json={"Vc": 10.0, "Fz": 0.1, "ap": 1.0, "job_id": "PART-4"}).json()
+    client.post("/measurements", json={"Ra_measured": pred["recommended_prediction"] + 0.05, "job_id": "PART-4"})
+
+    r = client.get("/accuracy/report")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["n_matched_pairs"] == 1
+    assert abs(body["bias_measured_minus_predicted"] - 0.05) < 1e-6
+
+
+def test_retrain_history_empty_by_default(client):
+    # isolated_prediction_log (autouse) already points at a fresh, empty
+    # temp database for this test
     r = client.get("/retrain/history")
     assert r.status_code == 200
     body = r.json()

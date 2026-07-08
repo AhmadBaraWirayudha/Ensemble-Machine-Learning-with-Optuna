@@ -15,6 +15,7 @@ Then open http://127.0.0.1:8000/docs for interactive API docs.
 """
 
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from app.schemas import (
     MachiningParams,
     PredictionResponse,
     RangeCheck,
+    MeasurementSubmission,
     BatchPredictionRequest,
     BatchPredictionResponse,
     HealthResponse,
@@ -38,6 +40,7 @@ from app.auth import require_api_key, auth_enabled
 from monitoring.request_log import log_prediction
 from monitoring.drift_monitor import analyze_drift, read_prediction_log, MIN_SAMPLES
 from monitoring.retrain_trigger import read_retrain_log
+from monitoring.storage import log_measurement, compute_accuracy_report
 
 # Populated at startup by the lifespan handler below. A plain module-level
 # dict (rather than app.state) keeps the "is anything loaded" check in
@@ -158,13 +161,16 @@ def feature_importance():
 def predict(params: MachiningParams):
     _require_model()
 
+    job_id = params.job_id or str(uuid.uuid4())
+
     result = predict_all(state["bundle"], params.Vc, params.Fz, params.ap)
     range_result = check_input_range(state["baseline"], params.Vc, params.Fz, params.ap)
 
-    log_prediction(params.Vc, params.Fz, params.ap, result)
+    log_prediction(params.Vc, params.Fz, params.ap, result, job_id=job_id)
 
     return PredictionResponse(
         input=params,
+        job_id=job_id,
         **result,
         range_check=RangeCheck(**range_result),
         model_trained_at=state["bundle"]["trained_at"],
@@ -177,13 +183,16 @@ def predict_batch(request: BatchPredictionRequest):
 
     predictions = []
     for params in request.items:
+        job_id = params.job_id or str(uuid.uuid4())
+
         result = predict_all(state["bundle"], params.Vc, params.Fz, params.ap)
         range_result = check_input_range(state["baseline"], params.Vc, params.Fz, params.ap)
-        log_prediction(params.Vc, params.Fz, params.ap, result)
+        log_prediction(params.Vc, params.Fz, params.ap, result, job_id=job_id)
 
         predictions.append(
             PredictionResponse(
                 input=params,
+                job_id=job_id,
                 **result,
                 range_check=RangeCheck(**range_result),
                 model_trained_at=state["bundle"]["trained_at"],
@@ -191,6 +200,36 @@ def predict_batch(request: BatchPredictionRequest):
         )
 
     return BatchPredictionResponse(predictions=predictions, count=len(predictions))
+
+
+@app.post("/measurements", dependencies=[Depends(require_api_key)])
+def submit_measurement(measurement: MeasurementSubmission):
+    """
+    Record a physical roughness measurement - e.g. from a stylus tester
+    like a TIME3233, via monitoring/../iot/time3233_reader.py, or entered
+    by hand. Tag it with the same job_id used at /predict time for the
+    same part to make it count toward GET /accuracy/report.
+    """
+    log_measurement(
+        ra_measured=measurement.Ra_measured,
+        job_id=measurement.job_id,
+        device=measurement.device,
+        raw_payload=measurement.raw_payload,
+    )
+    return {"status": "recorded", "job_id": measurement.job_id}
+
+
+@app.get("/accuracy/report", dependencies=[Depends(require_api_key)])
+def accuracy_report():
+    """
+    Compares predictions to the physical measurements later submitted for
+    the same job_id - the real test of production accuracy, since it's
+    checked against ground truth rather than just watching whether input
+    parameters have drifted (that's what /drift/report does; this is a
+    different, stronger signal that only exists once there's enough
+    predict-then-measure traffic tagged with matching job_ids).
+    """
+    return compute_accuracy_report()
 
 
 @app.get("/drift/report", dependencies=[Depends(require_api_key)])

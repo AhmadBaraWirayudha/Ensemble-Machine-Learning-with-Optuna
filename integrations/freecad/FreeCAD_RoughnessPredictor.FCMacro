@@ -1,0 +1,233 @@
+"""
+FreeCAD_RoughnessPredictor.FCMacro
+
+Predicts CNC surface roughness (Ra) for FreeCAD Path (CAM) operations, by
+calling this project's prediction API. Install: copy this whole
+`integrations/freecad/` folder into your FreeCAD Macro directory (Edit ->
+Preferences -> General -> Macro, "Macro path"), then Macro -> Macros ->
+run FreeCAD_RoughnessPredictor.FCMacro. Or just run it from the Python
+console with `exec(open(path_to_this_file).read())`.
+
+IMPORTANT - read before relying on this: this was built without a FreeCAD
+installation available to test against (see integrations/freecad/README.md).
+FreeCAD's Path workbench property names are well-documented and fairly
+stable, but they aren't 100% fixed across versions/operation types, so:
+
+  - Every property this macro reads from your document is read
+    defensively, via roughness_predictor_core.extract_operation_properties()
+    (several plausible attribute paths tried per value; none resolving
+    just means that field comes back empty, not a crash). That function
+    doesn't actually import FreeCAD - it's duck-typed attribute traversal -
+    which means it's the one part of this integration that *could* be
+    unit-tested here, against mock objects standing in for real FreeCAD
+    Path objects (see tests/test_freecad_integration.py in the main repo).
+  - Every derived value (tool diameter, RPM, feed rate, flute count,
+    step-down) is shown in an EDITABLE field before anything is sent to
+    the API - review and correct these rather than trusting them blindly,
+    especially the first time you use this on a given FreeCAD version.
+  - If a job/operation structure isn't found at all, you can still type
+    values in by hand and use this as a simple calculator + API client.
+
+The unit-conversion math (Vc from diameter+RPM, Fz from feed
+rate+RPM+flutes) is also in roughness_predictor_core.py and is fully
+unit-tested the same way - it's only the Qt panel below, and the fact of
+FreeCAD actually exposing the properties this macro looks for, that
+couldn't be run end-to-end without FreeCAD itself installed.
+"""
+
+import os
+import sys
+
+import FreeCAD
+import FreeCADGui
+
+MACRO_DIR = os.path.dirname(os.path.abspath(__file__))
+if MACRO_DIR not in sys.path:
+    sys.path.insert(0, MACRO_DIR)
+
+from roughness_predictor_core import (  # noqa: E402
+    operation_to_machining_params,
+    RoughnessPredictorClient,
+    find_path_jobs,
+    get_operations,
+    extract_operation_properties,
+)
+
+# FreeCAD's Qt binding has changed across versions (PySide -> PySide2 ->
+# PySide6); try them in the order recent FreeCAD releases use it.
+try:
+    from PySide6 import QtWidgets, QtCore
+except ImportError:
+    try:
+        from PySide2 import QtWidgets, QtCore
+    except ImportError:
+        from PySide import QtGui as QtWidgets, QtCore  # FreeCAD <= 0.19
+
+
+DEFAULT_API_URL = "http://127.0.0.1:8000"
+
+
+# --------------------------------------------------------------------
+# Task panel
+# --------------------------------------------------------------------
+
+class RoughnessPredictorPanel:
+    def __init__(self):
+        self.form = QtWidgets.QWidget()
+        self.form.setWindowTitle("CNC Roughness Predictor")
+        layout = QtWidgets.QVBoxLayout(self.form)
+
+        # --- connection ---
+        conn_group = QtWidgets.QGroupBox("API connection")
+        conn_layout = QtWidgets.QFormLayout(conn_group)
+        self.api_url_field = QtWidgets.QLineEdit(DEFAULT_API_URL)
+        self.api_key_field = QtWidgets.QLineEdit()
+        self.api_key_field.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.api_key_field.setPlaceholderText("only if the service has CNC_API_KEY set")
+        conn_layout.addRow("API URL", self.api_url_field)
+        conn_layout.addRow("API key", self.api_key_field)
+        layout.addWidget(conn_group)
+
+        # --- operation picker ---
+        op_group = QtWidgets.QGroupBox("Path operation")
+        op_layout = QtWidgets.QVBoxLayout(op_group)
+        self.operation_combo = QtWidgets.QComboBox()
+        self.operations = self._discover_operations()
+        for props in self.operations:
+            self.operation_combo.addItem(props["label"])
+        self.operation_combo.currentIndexChanged.connect(self._on_operation_selected)
+        op_layout.addWidget(self.operation_combo)
+        if not self.operations:
+            op_layout.addWidget(QtWidgets.QLabel(
+                "No Path operations found in the active document - enter values manually below."
+            ))
+        layout.addWidget(op_group)
+
+        # --- editable derived parameters (see module docstring: always review these) ---
+        params_group = QtWidgets.QGroupBox("Parameters (verify before predicting)")
+        params_layout = QtWidgets.QFormLayout(params_group)
+        self.diameter_field = QtWidgets.QLineEdit()
+        self.rpm_field = QtWidgets.QLineEdit()
+        self.feedrate_field = QtWidgets.QLineEdit()
+        self.flutes_field = QtWidgets.QLineEdit()
+        self.stepdown_field = QtWidgets.QLineEdit()
+        self.job_id_field = QtWidgets.QLineEdit()
+        params_layout.addRow("Tool diameter (mm)", self.diameter_field)
+        params_layout.addRow("Spindle speed (RPM)", self.rpm_field)
+        params_layout.addRow("Feed rate (mm/min)", self.feedrate_field)
+        params_layout.addRow("Flute count", self.flutes_field)
+        params_layout.addRow("Step down / ap (mm)", self.stepdown_field)
+        params_layout.addRow("Job ID (for later measurement matching)", self.job_id_field)
+        layout.addWidget(params_group)
+
+        if self.operations:
+            self._on_operation_selected(0)
+
+        # --- predict ---
+        predict_button = QtWidgets.QPushButton("Predict Ra")
+        predict_button.clicked.connect(self._on_predict)
+        layout.addWidget(predict_button)
+
+        self.result_label = QtWidgets.QLabel("")
+        self.result_label.setWordWrap(True)
+        layout.addWidget(self.result_label)
+
+        # --- measurement logging ---
+        meas_group = QtWidgets.QGroupBox("After machining: log the actual measurement")
+        meas_layout = QtWidgets.QHBoxLayout(meas_group)
+        self.measured_ra_field = QtWidgets.QLineEdit()
+        self.measured_ra_field.setPlaceholderText("measured Ra (um)")
+        submit_button = QtWidgets.QPushButton("Submit measurement")
+        submit_button.clicked.connect(self._on_submit_measurement)
+        meas_layout.addWidget(self.measured_ra_field)
+        meas_layout.addWidget(submit_button)
+        layout.addWidget(meas_group)
+
+    def _discover_operations(self):
+        doc = FreeCAD.ActiveDocument
+        if doc is None:
+            return []
+        found = []
+        for job in find_path_jobs(doc):
+            for op in get_operations(job):
+                props = extract_operation_properties(op)
+                props["job_id"] = f"{getattr(job, 'Label', 'Job')}_{props['label']}"
+                found.append(props)
+        return found
+
+    def _on_operation_selected(self, index):
+        if index < 0 or index >= len(self.operations):
+            return
+        props = self.operations[index]
+        self.diameter_field.setText(str(props["diameter_mm"]) if props["diameter_mm"] else "")
+        self.rpm_field.setText(str(props["rpm"]) if props["rpm"] else "")
+        self.feedrate_field.setText(str(props["feedrate_mm_per_min"]) if props["feedrate_mm_per_min"] else "")
+        self.flutes_field.setText(str(props["num_flutes"]) if props["num_flutes"] else "")
+        self.stepdown_field.setText(str(props["step_down_mm"]) if props["step_down_mm"] else "")
+        self.job_id_field.setText(props["job_id"])
+
+    def _client(self):
+        return RoughnessPredictorClient(
+            api_url=self.api_url_field.text().strip() or DEFAULT_API_URL,
+            api_key=self.api_key_field.text().strip() or None,
+        )
+
+    def _on_predict(self):
+        try:
+            diameter = float(self.diameter_field.text())
+            rpm = float(self.rpm_field.text())
+            feedrate = float(self.feedrate_field.text())
+            flutes = int(float(self.flutes_field.text()))
+            step_down = float(self.stepdown_field.text())
+        except ValueError:
+            self.result_label.setText("Fill in all of diameter/RPM/feed rate/flutes/step-down as numbers first.")
+            return
+
+        job_id = self.job_id_field.text().strip() or None
+
+        try:
+            params = operation_to_machining_params(diameter, rpm, feedrate, flutes, step_down, job_id=job_id)
+            result = self._client().predict(**params)
+        except Exception as e:
+            self.result_label.setText(f"Prediction failed: {e}")
+            return
+
+        self.last_job_id = result.get("job_id")
+        self.job_id_field.setText(self.last_job_id or "")
+
+        self.result_label.setText(
+            f"Vc={params['Vc']:.2f} m/min, Fz={params['Fz']:.4f} mm/tooth, ap={params['ap']:.2f} mm\n"
+            f"Recommended prediction ({result['recommended_model']}): Ra = {result['recommended_prediction']:.4f} um\n"
+            f"Within training envelope: {result['range_check']['within_training_envelope']}\n"
+            f"job_id: {self.last_job_id}  (use this when logging the actual measurement below)"
+        )
+
+    def _on_submit_measurement(self):
+        try:
+            ra_measured = float(self.measured_ra_field.text())
+        except ValueError:
+            self.result_label.setText("Enter a numeric measured Ra value first.")
+            return
+
+        job_id = self.job_id_field.text().strip() or None
+        try:
+            result = self._client().submit_measurement(ra_measured, job_id=job_id, device="manual-freecad")
+        except Exception as e:
+            self.result_label.setText(f"Submitting measurement failed: {e}")
+            return
+
+        self.result_label.setText(f"Measurement recorded: {result}")
+
+    def accept(self):
+        FreeCADGui.Control.closeDialog()
+
+    def reject(self):
+        FreeCADGui.Control.closeDialog()
+
+
+def main():
+    panel = RoughnessPredictorPanel()
+    FreeCADGui.Control.showDialog(panel)
+
+
+main()

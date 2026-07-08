@@ -356,6 +356,96 @@ changes - a fully nested CV (an outer loop the hyperparameter search
 never sees) would remove it but wasn't implemented here, consistent with
 the original design. Worth knowing if reporting these numbers externally.
 
+## Round 3: SQLite, and integrating a real CAM tool + a real measurement device
+
+Asked to integrate three concrete things: FreeCAD (CAM), a TIME3233
+physical roughness tester, and to swap the JSONL logs mentioned as a
+"future improvement" in Round 2. All three turned out to connect: the
+storage swap is what makes the other two actually useful together.
+
+**Why SQLite, specifically, and not a "real" time-series database.** The
+JSONL files worked fine for "append a record, read them all back later" -
+which is all drift monitoring and retrain history ever needed. Linking a
+prediction to the physical measurement of the same part is a genuinely
+different kind of access (a join, by `job_id`), and a flat append-only
+file is the wrong tool for that regardless of format. The standard answer
+at real production scale would be a dedicated time-series database
+(InfluxDB, TimescaleDB, ...), but that's a second service to run, network
+configuration, and a new heavy dependency - real cost for a single-node
+service at this project's actual traffic. SQLite is a Python standard
+library module (no new dependency at all), is still just one file (as
+easy to back up or mount as a Docker volume as the JSONL files were), and
+WAL mode (enabled in `monitoring/storage.py`) handles concurrent
+reads-while-writing fine at this scale. `monitoring/request_log.py`
+becomes a thin re-export shim over the new `monitoring/storage.py` so
+existing import sites didn't need to change;
+`scripts/migrate_jsonl_to_sqlite.py` is a one-time import for anyone
+upgrading from a version of this project that had accumulated real JSONL
+history.
+
+**The `job_id` / measurements / accuracy-report design.** `/predict` now
+accepts an optional `job_id` (auto-generated if omitted, always echoed
+back in the response) and a new `POST /measurements` accepts a physical
+reading tagged with the same id. `GET /accuracy/report` joins the two and
+reports real RMSE/MAE/MAPE/bias between *predicted* and *measured* Ra -
+answering a different and stronger question than
+`monitoring/drift_monitor.py` does. Drift monitoring watches whether
+*inputs* have shifted from training; the accuracy report checks whether
+*predictions* are still actually correct, against ground truth. Nothing
+about this required either integration below to exist first - it's
+useful the moment anything (a script, a curl command, a human) submits a
+measurement - but the two integrations are what make it easy to actually
+populate in a real shop.
+
+**TIME3233: verified facts vs. an undocumented protocol, and what was
+built around that gap.** Confirmed via product listings: it's a portable
+stylus roughness tester (Beijing TIME High Technology), 50mm traversing
+length, 800um range, ~55 parameters including Ra, and it transfers to a
+PC over RS232 - normally via the vendor's "TIMESurf" software, which can
+also export a session to Excel. Not confirmed anywhere: the actual
+byte-level serial protocol TIMESurf speaks to the device. Rather than
+guess at a specification and present it as working,
+`integrations/time3233/reader.py` ships two paths: watching the folder
+TIMESurf exports to (recommended - depends only on a documented,
+vendor-controlled export format, via a header-detection heuristic robust
+enough to find "Ra" under several plausible column-naming schemes without
+false-matching things like "Range" or "Parameter" - see
+`find_ra_column()` and its tests) and a best-effort direct-serial mode
+(common RS232 defaults for this instrument class, a configurable regex,
+and a `raw-capture` mode built specifically to let you discover your
+actual device's real output format rather than trust an assumed one).
+Both were tested for real: the export-watching path end-to-end against a
+live API instance (synthetic export file -> ingested -> matched to a real
+prediction via job_id -> correct accuracy-report numbers); the
+serial-specific code paths only via `pyserial` being importable and the
+regex/parsing logic in isolation, since no physical device was available.
+
+**FreeCAD: what's tested vs. what's read defensively.** No FreeCAD
+installation was available to test against, so the integration is split
+by how confident each half is. `roughness_predictor_core.py` - unit
+conversions (`Vc = pi*D*N/1000`, `Fz = feed_rate/(N*flutes)`, checked
+against hand calculations and round-tripped through their inverses) and
+the FreeCAD-object attribute-extraction logic - has zero FreeCAD
+dependency (it's duck-typed attribute traversal, not an import of
+`FreeCAD`/`FreeCADGui`) and so is fully unit-tested, including against
+mock objects standing in for FreeCAD's Path/ToolController/Tool model.
+`FreeCAD_RoughnessPredictor.FCMacro` - the actual Qt panel that runs
+inside FreeCAD - could not be run in the environment this was built in.
+It's written to degrade gracefully rather than assume it's right: every
+property is read via several plausible attribute paths with `hasattr`
+guards, and every derived value is shown in an editable field for the
+user to review before anything is sent to the API, rather than trusting
+extraction blindly. See `integrations/freecad/README.md`.
+
+**New tests.** `test_storage.py` (SQLite predictions/measurements/
+retrain-events round-trip, accuracy-report join logic including the
+latest-measurement-wins-on-remeasure case), `test_time3233_integration.py`
+(Ra-column detection including deliberate false-positive traps like
+"Range"/"Parameter", export parsing, the serial regex, mocked HTTP
+submission), `test_freecad_integration.py` (unit conversions, the HTTP
+client, and the mock-object extraction tests described above) - 70 new
+tests, 138 total.
+
 ## Explicitly not touched
 
 - **`configs/*.yaml`** - never wired to any code (no file in `src/` reads

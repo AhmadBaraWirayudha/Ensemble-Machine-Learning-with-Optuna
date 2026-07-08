@@ -49,8 +49,13 @@ On the currently-shipped model, **Gradient Boosting alone is the best performer*
 - Replicate-aware cross-validation (`StratifiedGroupKFold`) - this dataset has 19 exact-duplicate design points that a naive CV split can leak across train/test
 - **Model persistence** - training produces a loadable artifact, not just metrics
 - **REST API** (FastAPI) with interactive docs, single + batch prediction, health/info endpoints
+- **SQLite storage** for predictions, physical measurements, and retrain history - queryable and joinable, not flat log files
 - **Data drift monitoring** (PSI + Kolmogorov-Smirnov) - standalone script or `/drift/report` endpoint
 - **Automatic retraining** with rollback - detects drift, retrains, and only promotes the result if it's actually better
+- **Physical measurement + accuracy tracking** - compare predictions against real measured roughness (e.g. from a stylus tester), not just watch for input drift
+- **FreeCAD integration** - predict Ra directly from a Path (CAM) job's tool/feed/speed parameters
+- **TIME3233 roughness tester integration** - feed real measurements in via TIMESurf's export or direct serial
+- Opt-in API key authentication
 - Automated metrics evaluation and plot generation
 - Docker + docker-compose for deployment
 
@@ -90,16 +95,27 @@ On the currently-shipped model, **Gradient Boosting alone is the best performer*
 ├── monitoring/
 │   ├── drift_monitor.py      # PSI/KS drift analysis, CLI + library
 │   ├── retrain_trigger.py    # checks drift, retrains + promotes/rolls back
-│   └── request_log.py        # shared JSONL prediction log (API writes, monitor reads)
+│   ├── storage.py             # SQLite backend: predictions, measurements, retrain events
+│   └── request_log.py        # thin re-export shim over storage.py (kept for import compatibility)
 │
 ├── scripts/
 │   ├── train_model.py        # CLI: train + persist a model bundle
-│   └── example_client.py     # example of a third-party system calling the API
+│   ├── example_client.py     # example of a third-party system calling the API
+│   └── migrate_jsonl_to_sqlite.py  # one-time import of any pre-upgrade .jsonl logs
+│
+├── integrations/
+│   ├── time3233/               # TIME3233 roughness tester -> POST /measurements
+│   │   ├── reader.py            # TIMESurf-export watcher + best-effort direct serial
+│   │   └── README.md            # what's verified vs. not (undocumented serial protocol)
+│   └── freecad/                 # FreeCAD Path (CAM) job -> POST /predict
+│       ├── roughness_predictor_core.py   # unit conversions + HTTP client (FreeCAD-independent, tested)
+│       ├── FreeCAD_RoughnessPredictor.FCMacro  # the actual FreeCAD macro (Qt panel)
+│       └── README.md
 │
 ├── data/raw/raw_data.csv
 ├── models/saved_models/       # model_bundle.joblib, model_metadata.json, training_baseline.csv, feature_importance.json
 │   └── archive/                # timestamped backups from monitoring/retrain_trigger.py
-├── logs/                       # prediction_log.jsonl, retrain_log.jsonl (created on first use)
+├── logs/production.db          # predictions, measurements, retrain events (SQLite; created on first use)
 ├── reports/{metrics,figures,drift}/
 ├── configs/                    # not currently wired to any code - see UPGRADE_NOTES.md
 ├── notebooks/
@@ -218,6 +234,8 @@ Interactive docs at `http://127.0.0.1:8000/docs`.
 |---|---|---|---|
 | `/predict` | POST | required if set | One `{Vc, Fz, ap}` in, every model's prediction + range check back |
 | `/predict/batch` | POST | required if set | Up to 500 points in one call |
+| `/measurements` | POST | required if set | Record a physical roughness measurement (e.g. from a stylus tester), optionally tagged with a `job_id` |
+| `/accuracy/report` | GET | required if set | Predicted-vs-actual accuracy, joining predictions to measurements by `job_id` |
 | `/health` | GET | never | Liveness + whether a model is loaded |
 | `/model/info` | GET | required if set | Metrics, hyperparameters, training timestamp |
 | `/model/feature-importance` | GET | required if set | Permutation importance, per engineered feature and rolled up to Vc/Fz/ap |
@@ -235,6 +253,7 @@ curl -X POST http://127.0.0.1:8000/predict \
 ```json
 {
   "input": {"Vc": 12.5, "Fz": 0.1, "ap": 1.0},
+  "job_id": "f8c65a3c-a0cf-44e5-9026-7d91595f337e",
   "svr_prediction": 1.17,
   "gpr_prediction": 1.25,
   "gpr_uncertainty_std": 0.31,
@@ -250,13 +269,13 @@ curl -X POST http://127.0.0.1:8000/predict \
 }
 ```
 
-Requests outside the training envelope (e.g. `Vc=500`) are still served, not rejected - they're flagged (`within_training_envelope: false`) instead, since rejecting them would mean the drift monitor never sees them either. Every served prediction is appended to `logs/prediction_log.jsonl` for the drift monitor to read.
+Requests outside the training envelope (e.g. `Vc=500`) are still served, not rejected - they're flagged (`within_training_envelope: false`) instead, since rejecting them would mean the drift monitor never sees them either. Every served prediction is recorded in `logs/production.db` for the drift monitor and accuracy report to read; pass `job_id` explicitly (or use the auto-generated one, echoed back in the response) to link it to a later physical measurement - see Physical Measurement & Accuracy Tracking below.
 
 ---
 
 # Authentication
 
-Off by default - every endpoint above works with no credential, same as a fresh clone of this repo always has. Set `CNC_API_KEY` to turn on API-key authentication for every data endpoint (`/predict`, `/predict/batch`, `/model/info`, `/model/feature-importance`, `/drift/report`, `/retrain/history`). `/health` never requires a key, so load balancers and container orchestrators can check liveness without one.
+Off by default - every endpoint above works with no credential, same as a fresh clone of this repo always has. Set `CNC_API_KEY` to turn on API-key authentication for every data endpoint (`/predict`, `/predict/batch`, `/measurements`, `/accuracy/report`, `/model/info`, `/model/feature-importance`, `/drift/report`, `/retrain/history`). `/health` never requires a key, so load balancers and container orchestrators can check liveness without one.
 
 ```bash
 export CNC_API_KEY="some-long-random-string"
@@ -310,9 +329,35 @@ python -m monitoring.retrain_trigger --dry-run
 python -m monitoring.retrain_trigger --force-retrain
 ```
 
-Before overwriting anything, the current model is backed up to `models/saved_models/archive/<timestamp>/`. After retraining, the new model's out-of-fold RMSE is compared against the old one's; if it's worse by more than `--max-regression-pct` (default 15%), the backup is restored instead of promoting a regression - an automated pipeline silently deploying a worse quality-prediction model is a worse outcome than it doing nothing. Every attempt is logged to `logs/retrain_log.jsonl`, readable via `GET /retrain/history`.
+Before overwriting anything, the current model is backed up to `models/saved_models/archive/<timestamp>/`. After retraining, the new model's out-of-fold RMSE is compared against the old one's; if it's worse by more than `--max-regression-pct` (default 15%), the backup is restored instead of promoting a regression - an automated pipeline silently deploying a worse quality-prediction model is a worse outcome than it doing nothing. Every attempt is recorded in `logs/production.db`, readable via `GET /retrain/history`.
 
 This is a CLI tool meant for a scheduled job (cron, CI pipeline, etc.), not an API endpoint - retraining takes minutes and overwrites the production model, neither of which belongs behind a synchronous HTTP call.
+
+---
+
+# Physical Measurement & Accuracy Tracking
+
+Everything above (drift monitoring, auto-retrain) watches whether *inputs* have shifted from training. It's a genuinely different, stronger question whether the model's *predictions* are still actually correct - and the only way to answer that is against ground truth: a real measurement of the part that was actually machined.
+
+Tag a prediction with a `job_id` (supplied or auto-generated - see the `/predict` example above), then after the part is machined and measured, submit the reading tagged with the same `job_id`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/predict -d '{"Vc": 12.5, "Fz": 0.1, "ap": 1.0, "job_id": "PART-42"}'
+# ... machine the part, measure it (see integrations/time3233/ below) ...
+curl -X POST http://127.0.0.1:8000/measurements \
+  -d '{"Ra_measured": 0.65, "job_id": "PART-42", "device": "TIME3233"}'
+curl http://127.0.0.1:8000/accuracy/report
+```
+
+`GET /accuracy/report` joins every prediction to its matching measurement (by `job_id`; the latest measurement wins if a part was re-measured) and reports RMSE/MAE/MAPE and bias between what was predicted and what was actually measured. Both are stored in `logs/production.db` (see `monitoring/storage.py`) - a real SQLite database rather than the flat JSONL files this project used before, specifically so this join is a normal indexed query instead of something a flat append-only log can't really do. A dedicated time-series database would be the standard answer at real production scale; SQLite (a Python stdlib module, still one file, WAL mode for concurrent reads/writes) is the right-sized choice at this project's actual scale - see `UPGRADE_NOTES.md`.
+
+---
+
+# External Integrations
+
+**`integrations/freecad/`** - predicts Ra directly from a FreeCAD Path (CAM) job: pick an operation, the macro derives `Vc`/`Fz`/`ap` from the tool diameter, spindle RPM, feed rate, and flute count you've already set up, shows them in editable fields for review, and calls the API. Log a measurement back in the same panel after machining. See `integrations/freecad/README.md` - importantly, for what's actually been verified given this was built without a FreeCAD installation to test against (the unit-conversion math is fully unit-tested; the exact FreeCAD property names are read defensively with editable fallbacks, not assumed).
+
+**`integrations/time3233/`** - feeds real measurements from a TIME3233 portable stylus roughness tester into `/measurements`. Two paths: watching the folder the vendor's own "TIMESurf" software exports to (recommended - doesn't depend on reverse-engineering anything), or best-effort direct serial (the exact protocol isn't publicly documented, so this needs verification against your actual device - see `integrations/time3233/README.md`, including a `raw-capture` mode built specifically to help with that verification).
 
 ---
 
@@ -328,13 +373,15 @@ source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+`pyserial` is commented out in `requirements.txt` - it's only needed for `integrations/time3233/reader.py`'s direct-serial mode (not its recommended TIMESurf-export-watching mode, and not needed anywhere else). Install it separately if you need that: `pip install pyserial`.
+
 # Running Tests
 
 ```bash
 pytest
 ```
 
-68 tests covering data loading, feature engineering, model construction (including the power-law model and replicate-grouping logic), metrics, persistence, inference, the API, authentication, drift detection, and automatic retraining. Most run against real artifacts (the actual training data, an actually-trained model) rather than mocks - train a model first (`python scripts/train_model.py`) if `models/saved_models/` is empty.
+138 tests covering data loading, feature engineering, model construction (including the power-law model and replicate-grouping logic), metrics, persistence, inference, the API, authentication, drift detection, automatic retraining, SQLite storage, and the FreeCAD/TIME3233 integrations. Most run against real artifacts (the actual training data, an actually-trained model) rather than mocks - train a model first (`python scripts/train_model.py`) if `models/saved_models/` is empty.
 
 ---
 
@@ -379,13 +426,20 @@ uncertainty than the current estimate; (2) capturing input variables this
 dataset doesn't have at all - tool wear state, coolant flow, tool
 geometry, machine vibration - which plausibly explain a real share of
 what's currently unexplained variance, no matter how good the model
-fitting `Vc`/`Fz`/`ap` alone gets.
+fitting `Vc`/`Fz`/`ap` alone gets. The infrastructure to actually collect
+option (1) at production scale now exists - `/measurements` and
+`/accuracy/report` (see Physical Measurement & Accuracy Tracking above)
+turn every predict-then-measure cycle into a labeled data point - but
+using it to retrain on *measured* Ra rather than the original static
+dataset isn't wired up yet; `scripts/train_model.py` still trains only
+from `data/raw/raw_data.csv`.
 
 Smaller/infrastructure-level items:
 
-- Swap the JSONL prediction log for a real time-series store at higher request volume
-- Real-time CNC/IoT integration feeding `monitoring/request_log.py` directly from machine controllers
-- CAD/CAM integration
+- Verify `integrations/time3233/`'s serial protocol and `integrations/freecad/`'s exact property names against real hardware/FreeCAD versions (both were built without either available - see their READMEs for exactly what's unverified)
+- Feed accumulated `/measurements` data back into training, not just the accuracy report
+- A real identity provider (OAuth2/similar) if this ever needs many distinct external users rather than a handful of trusted internal systems (current auth is a single shared API key - see Authentication)
+- A proper time-series database if request volume ever outgrows SQLite (see Physical Measurement & Accuracy Tracking above for why SQLite was the right-sized choice for now)
 
 ---
 
@@ -397,11 +451,13 @@ Smaller/infrastructure-level items:
 | ML | Scikit-learn |
 | Optimization | Optuna |
 | API | FastAPI, Uvicorn, Pydantic |
+| Storage | SQLite (predictions, measurements, retrain events) |
 | Monitoring | SciPy (KS test), custom PSI implementation |
 | Visualization | Matplotlib |
 | Data | Pandas, NumPy |
+| Integrations | FreeCAD Path/Qt (macro), pyserial (optional, TIME3233 direct serial), openpyxl (TIMESurf Excel export) |
 | Deployment | Docker, docker-compose |
-| Testing | Pytest, httpx |
+| Testing | Pytest, httpx, responses |
 
 ---
 

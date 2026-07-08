@@ -23,6 +23,9 @@ tests/
 ├── test_drift_monitor.py  (new: PSI/KS drift statistics)
 ├── test_feature_importance.py  (new: permutation importance)
 ├── test_retrain_trigger.py     (new: auto-retrain backup/promote/rollback)
+├── test_storage.py             (new: SQLite backend - predictions, measurements, accuracy)
+├── test_time3233_integration.py  (new: TIME3233 reader - export parsing, HTTP submission)
+├── test_freecad_integration.py   (new: FreeCAD macro core - unit conversions, extraction logic)
 └── README.md
 ```
 
@@ -43,22 +46,29 @@ tests/
 | `test_drift_monitor.py` | PSI/KS drift statistics behave correctly on known distributions |
 | `test_feature_importance.py` | Permutation importance ranks a known-informative feature correctly |
 | `test_retrain_trigger.py` | Backup/restore round-trip, and promote-vs-rollback decision logic (training itself is mocked out so these run in ~1s instead of minutes) |
+| `test_storage.py` | SQLite predictions/measurements round-trip; accuracy report joins correctly by job_id and picks the latest measurement on re-measure |
+| `test_time3233_integration.py` | Ra-column detection heuristic, Excel/CSV export parsing, serial regex pattern, HTTP submission (mocked) |
+| `test_freecad_integration.py` | Unit conversions (checked against hand calculations), HTTP client (mocked), attribute-extraction logic (against mock Path objects) |
 
 Most of these tests run against real artifacts (the actual training CSV,
 an actual trained model bundle) rather than mocks, matching how the
 original tests in this directory were written. `test_persistence.py` and
 `test_persistence.py::test_save_and_load_round_trip` additionally use a
 `tmp_path` fixture so bundle save/load is verified in isolation too.
-`test_api.py` redirects the prediction log to a temp file (via
-`monkeypatch`) so running the suite doesn't add fake traffic to the real
-`logs/prediction_log.jsonl` that the drift monitor reads from.
+`test_api.py` and `test_auth.py` redirect the production database to a
+temp file (via `monkeypatch`, since it's just a SQLite file path -
+see `monitoring/storage.py`) so running the suite doesn't add fake
+traffic to the real `logs/production.db` that the drift monitor and
+accuracy report read from.
 
 **Prerequisite:** `test_persistence.py`, `test_inference.py`, and the
 model-dependent parts of `test_api.py` need a trained model to already
 exist. Run `python scripts/train_model.py` once before testing if
 `models/saved_models/` is empty. `test_retrain_trigger.py` mocks out
 `src.train.main` entirely, so it doesn't need this and doesn't take
-minutes to run.
+minutes to run. `test_storage.py`, `test_time3233_integration.py`, and
+`test_freecad_integration.py` don't need it either - they use an isolated
+temp database and mocked HTTP calls respectively.
 
 ---
 

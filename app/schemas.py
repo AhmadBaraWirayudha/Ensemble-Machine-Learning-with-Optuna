@@ -16,6 +16,15 @@ class MachiningParams(BaseModel):
     Vc: float = Field(..., gt=0, le=1000, description="Cutting speed (m/min)")
     Fz: float = Field(..., gt=0, le=10, description="Feed per tooth (mm/tooth)")
     ap: float = Field(..., gt=0, le=100, description="Axial depth of cut (mm)")
+    job_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional identifier for the part/job this prediction is for. "
+            "If supplied, a later physical measurement (POST /measurements) "
+            "tagged with the same job_id can be compared against this "
+            "prediction via GET /accuracy/report. Auto-generated if omitted."
+        ),
+    )
 
     model_config = ConfigDict(
         json_schema_extra={"examples": [{"Vc": 10.0, "Fz": 0.1, "ap": 1.0}]}
@@ -32,6 +41,7 @@ class RangeCheck(BaseModel):
 
 class PredictionResponse(BaseModel):
     input: MachiningParams
+    job_id: str = Field(..., description="Echoes input.job_id, or an auto-generated one if none was supplied - use this to tag a later measurement.")
 
     svr_prediction: float = Field(..., description="Predicted Ra (surface roughness, um) from the SVR model")
     gpr_prediction: float = Field(..., description="Predicted Ra from the Gaussian Process model")
@@ -49,6 +59,15 @@ class PredictionResponse(BaseModel):
     range_check: RangeCheck
 
     model_trained_at: str
+
+
+class MeasurementSubmission(BaseModel):
+    """A physical roughness measurement, e.g. from a stylus tester."""
+
+    Ra_measured: float = Field(..., gt=0, description="Measured Ra (surface roughness, um)")
+    job_id: Optional[str] = Field(default=None, description="Same job_id used when calling /predict for this part, so the two can be compared later.")
+    device: Optional[str] = Field(default=None, description="Instrument name/model, e.g. 'TIME3233'")
+    raw_payload: Optional[str] = Field(default=None, description="Original raw reading/line from the device, kept for traceability/debugging")
 
 
 class BatchPredictionRequest(BaseModel):
